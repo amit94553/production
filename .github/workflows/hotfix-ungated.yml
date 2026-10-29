@@ -1,0 +1,21 @@
+name: Hotfix (ungated decoy)
+
+# A deliberate gap for testing atlasent-exposure-scan. This workflow "deploys"
+# without an AtlaSent gate, the way a rushed hotfix path often does. It only
+# echoes, so running it changes nothing. The scanner should report it as an
+# ungated path to production; deploy.yml should show as gated.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  hotfix:
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Apply hotfix
+        run: |
+          echo "would run: kubectl apply -f k8s/ --namespace production"

@@ -1,0 +1,231 @@
+name: Deploy (AtlaSent gated)
+
+# Builds a dummy site, asks AtlaSent for a permit bound to the artifact digest,
+# waits for a person to approve in the AtlaSent console, verifies and consumes
+# the permit, then runs a dummy deploy.
+#
+# Run it by hand (Actions -> Deploy -> Run workflow) to pick a scenario:
+#   normal          the happy path; the deploy runs
+#   changed-target  verify the permit for a different target; must be refused
+#   tampered-plan   verify with a modified execution hash; must be refused
+#   replay          deploy once, then present the same permit again; must be refused
+#   rehearsal       AtlaSent's five-case rehearsal (needs an id from the console)
+#
+# This file is the one enrolled as the workload binding in the AtlaSent console.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      scenario:
+        description: What to test
+        type: choice
+        default: normal
+        options: [normal, changed-target, tampered-plan, replay, rehearsal]
+      rehearsal_request_id:
+        description: Rehearsal id issued by the AtlaSent console (rehearsal only)
+        required: false
+        default: ''
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  TARGET_ID: service:sandbox-web
+  ATLASENT_ENV: production
+
+jobs:
+  build:
+    if: inputs.scenario != 'rehearsal'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build
+        run: ./scripts/build.sh out
+
+      - name: Compute artifact digest
+        id: digest
+        run: echo "digest=$(./scripts/digest.sh out)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: site
+          path: out/
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    # Must match the GitHub Environment in the console's workload binding.
+    environment: production
+    permissions:
+      contents: read
+      id-token: write   # the Action exchanges the job's OIDC token for a verified actor
+    env:
+      SCENARIO: ${{ inputs.scenario || 'normal' }}
+      ARTIFACT_DIGEST: ${{ needs.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: site
+          path: out/
+
+      # AtlaSent only checks the declared digest. This step checks the bytes.
+      - name: Check the downloaded bytes match the built digest
+        run: |
+          actual="$(./scripts/digest.sh out)"
+          if [ "$actual" != "$ARTIFACT_DIGEST" ]; then
+            echo "::error::Downloaded artifact ($actual) does not match the built digest ($ARTIFACT_DIGEST)"
+            exit 1
+          fi
+          echo "Artifact digest matches: $actual"
+
+      - name: AtlaSent gate (issue permit, wait for approval)
+        id: gate
+        uses: Atlasent/atlasent-action@v1
+        env:
+          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
+        with:
+          action: production.deploy
+          environment: ${{ env.ATLASENT_ENV }}
+          target-id: ${{ env.TARGET_ID }}
+          artifact-digest: ${{ env.ARTIFACT_DIGEST }}
+          mode: evaluate-only        # issue the permit here, consume it at the verify step
+          wait-for-approval: "true"  # on hold, wait for a person to approve in the console
+          max-wait-minutes: "30"
+          approvals-from: none       # approval comes from AtlaSent, not PR reviews
+
+      - name: Prepare the scenario
+        id: scenario
+        env:
+          EXECUTION_HASH: ${{ steps.gate.outputs.execution-hash }}
+        run: |
+          target="$TARGET_ID"
+          hash="$EXECUTION_HASH"
+          case "$SCENARIO" in
+            changed-target)
+              target="${TARGET_ID}-tampered" ;;
+            tampered-plan)
+              # Flip the last character of the execution hash.
+              last="${hash: -1}"
+              if [ "$last" = "0" ]; then hash="${hash%?}1"; else hash="${hash%?}0"; fi ;;
+          esac
+          echo "target=$target" >> "$GITHUB_OUTPUT"
+          echo "hash=$hash" >> "$GITHUB_OUTPUT"
+          echo "Scenario: $SCENARIO  target: $target"
+
+      - name: AtlaSent verify (consume the permit)
+        id: verify
+        continue-on-error: ${{ env.SCENARIO == 'changed-target' || env.SCENARIO == 'tampered-plan' }}
+        uses: Atlasent/atlasent-action@v1
+        env:
+          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
+        with:
+          verify-permit: "true"
+          permit-token: ${{ steps.gate.outputs.permit-token }}
+          execution-hash: ${{ steps.scenario.outputs.hash }}
+          action: production.deploy
+          environment: ${{ env.ATLASENT_ENV }}
+          target-id: ${{ steps.scenario.outputs.target }}
+
+      - name: Deploy (dummy)
+        if: steps.verify.outputs.verified == 'true' && (env.SCENARIO == 'normal' || env.SCENARIO == 'replay')
+        run: ./scripts/deploy.sh out
+
+      - name: Present the same permit again (replay only)
+        id: replay
+        if: env.SCENARIO == 'replay'
+        continue-on-error: true
+        uses: Atlasent/atlasent-action@v1
+        env:
+          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
+        with:
+          verify-permit: "true"
+          permit-token: ${{ steps.gate.outputs.permit-token }}
+          execution-hash: ${{ steps.gate.outputs.execution-hash }}
+          action: production.deploy
+          environment: ${{ env.ATLASENT_ENV }}
+          target-id: ${{ env.TARGET_ID }}
+
+      - name: Check the result
+        if: always()
+        env:
+          DECISION: ${{ steps.gate.outputs.decision }}
+          PERMIT_ISSUED: ${{ steps.gate.outputs.permit-issued }}
+          WAITED: ${{ steps.gate.outputs.waited-for-approval }}
+          VERIFIED: ${{ steps.verify.outputs.verified }}
+          VERIFY_CODE: ${{ steps.verify.outputs.verify-error-code }}
+          REPLAY_VERIFIED: ${{ steps.replay.outputs.verified }}
+          REPLAY_CODE: ${{ steps.replay.outputs.verify-error-code }}
+        run: |
+          pass=true
+          case "$SCENARIO" in
+            normal)
+              expected="permit verified, deploy ran"
+              [ "$VERIFIED" = "true" ] || pass=false
+              actual="verified=${VERIFIED:-none} ${VERIFY_CODE}" ;;
+            changed-target)
+              expected="refused, PERMIT_BINDING_MISMATCH"
+              [ "$PERMIT_ISSUED" = "true" ] && [ "$VERIFIED" != "true" ] || pass=false
+              actual="verified=${VERIFIED:-none} ${VERIFY_CODE}" ;;
+            tampered-plan)
+              expected="refused, PAYLOAD_MISMATCH"
+              [ "$PERMIT_ISSUED" = "true" ] && [ "$VERIFIED" != "true" ] || pass=false
+              actual="verified=${VERIFIED:-none} ${VERIFY_CODE}" ;;
+            replay)
+              expected="first use verified; second refused, PERMIT_ALREADY_USED"
+              [ "$VERIFIED" = "true" ] && [ "$REPLAY_VERIFIED" != "true" ] || pass=false
+              actual="first verified=${VERIFIED:-none}; second verified=${REPLAY_VERIFIED:-none} ${REPLAY_CODE}" ;;
+          esac
+          {
+            echo "### AtlaSent scenario: $SCENARIO"
+            echo
+            echo "| Field | Value |"
+            echo "| --- | --- |"
+            echo "| Gate decision | ${DECISION:-none} |"
+            echo "| Permit issued | ${PERMIT_ISSUED:-false} |"
+            echo "| Waited for approval | ${WAITED:-false} |"
+            echo "| Expected | $expected |"
+            echo "| Actual | $actual |"
+            echo "| Result | $([ "$pass" = true ] && echo PASS || echo FAIL) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "Expected: $expected"
+          echo "Actual:   $actual"
+          [ "$pass" = true ] || { echo "::error::Scenario $SCENARIO did not behave as expected"; exit 1; }
+
+  rehearsal:
+    if: inputs.scenario == 'rehearsal'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: AtlaSent authorization rehearsal
+        id: rehearsal
+        uses: Atlasent/atlasent-action@v1
+        env:
+          ATLASENT_API_KEY: ${{ secrets.ATLASENT_API_KEY }}
+        with:
+          rehearsal-request-id: ${{ inputs.rehearsal_request_id }}
+          action: production.deploy
+          target-id: ${{ env.TARGET_ID }}
+          environment: ${{ env.ATLASENT_ENV }}
+          max-wait-minutes: "30"
+
+      - name: Show the cases
+        if: always()
+        env:
+          VERDICT: ${{ steps.rehearsal.outputs.rehearsal-verdict }}
+          CASES: ${{ steps.rehearsal.outputs.rehearsal-cases }}
+        run: |
+          echo "Verdict: ${VERDICT:-none}"
+          echo "${CASES:-[]}" | jq -r '.[] | "\(.case_id): \(.status) (decision=\(.decision // "-") code=\(.deny_code // .verify_error_code // "-"))"' || echo "$CASES"
